@@ -1,0 +1,284 @@
+PROGRAM MAIN
+VAR
+    // ==========================================================
+    // 1) ENGINEERING-SOLLWERTE / ISTWERTE PRO KANAL
+    //    hier legst du fest, welche spannungen du fahren willst
+    //    und wie die zurückgerechneten werte heißen
+    // ==========================================================
+
+    // ---- kanal 1 ----
+    Set_Ch1_U   : LREAL := 0.0;  // sollwert kanal 1 in V           (TODO: bedeutung beschreiben)
+    Read_Ch1_U  : LREAL;         // istwert kanal 1 in V            (wird aus AI_Ch1 berechnet)
+    Ch1_U_MAX   : LREAL := 500.0; // max. spannung kanal 1 in V     (TODO: an dein gerät anpassen)
+
+    // ---- kanal 2 ----
+    Set_Ch2_U   : LREAL := 0.0;  
+    Read_Ch2_U  : LREAL;
+    Ch2_U_MAX   : LREAL := 500.0; // TODO: anpassen (z.b. 30, 75, 6500...)
+
+    // ---- kanal 3 ----
+    Set_Ch3_U   : LREAL := 0.0;  
+    Read_Ch3_U  : LREAL;
+    Ch3_U_MAX   : LREAL := 500.0; // TODO: anpassen
+
+    // wenn du mehr kanäle brauchst: block kopieren (ch4, ch5, ...)
+
+    // ==========================================================
+    // 2) ROHWERTE I/O (direkt im prozessabbild)
+    //    hier trägst du die %QW / %IW adressen aus der I/O-config ein oder man sagt einfach %Q* bzw %I* und macht es über das IO MAPPING (das ist viel leichter und übersichtlicher)
+    // ==========================================================
+
+    // ---- analog out (EL4104, 0..10 V -> 0..32767) ----
+    AO_Ch1   AT %QW0 : INT;   // TODO: richtige adresse aus prozessabbild eintragen
+    AO_Ch2   AT %QW2 : INT;   // TODO
+    AO_Ch3   AT %QW4 : INT;   // TODO
+
+    // ---- analog in (EL3164, 0..10 V -> 0..32767) ----
+    AI_Ch1   AT %IW0 : INT;   // TODO: richtige adresse eintragen
+    AI_Ch2   AT %IW2 : INT;   // TODO
+    AI_Ch3   AT %IW4 : INT;   // TODO
+
+    // ==========================================================
+    // 3) ALLGEMEINE SKALIER-KONSTANTEN
+    // ==========================================================
+    AO_RANGE_V     : LREAL := 10.0;      // EL4104 spannungsbereich 0..10 V
+    AI_RANGE_V     : LREAL := 10.0;      // EL3164 spannungsbereich 0..10 V
+    AO_FULL_SCALE  : LREAL := 32767.0;   // max. DAC-count
+    AI_FULL_SCALE  : LREAL := 32767.0;   // max. ADC-count
+
+    // ==========================================================
+    // 4) MQTT – CLIENT, QUEUE, HILFSVARIABLEN
+    // ==========================================================
+    fbMqttClient   : FB_IotMqttClient;         // mqtt client baustein
+    fbMessageQueue : FB_IotMqttMessageQueue;  // queue für eingehende nachrichten
+    fbMessage      : FB_IotMqttMessage;       // eine nachricht beim dequeue
+    bMqttInit      : BOOL := TRUE;            // init flag (einmalig)
+    bSubsDone      : BOOL := FALSE;           // subscriptions gesetzt ja/nein
+
+    sBuf  : STRING(128);  // sendepuffer für payload
+    nSize : UDINT;        // payload-länge
+
+    // ==========================================================
+    // 5) MQTT TOPICS PRO KANAL
+    //    HIER MUSST DU DEINE TOPIC-NAMEN EINTRAGEN
+    // ==========================================================
+
+    // ---- kanal 1 ----
+    tCh1_cmd_set : STRING(63) := 'device/ch1/cmd/set_u';  // TODO: topic für eingehenden sollwert
+    tCh1_set     : STRING(63) := 'device/ch1/set_u';      // published sollwert
+    tCh1_meas    : STRING(63) := 'device/ch1/meas_u';     // published istwert
+    tCh1_dbgAo   : STRING(63) := 'device/ch1/dbg/ao';     // published counts (debug)
+
+    // ---- kanal 2 ----
+    tCh2_cmd_set : STRING(63) := 'device/ch2/cmd/set_u';  // TODO: anpassen
+    tCh2_set     : STRING(63) := 'device/ch2/set_u';
+    tCh2_meas    : STRING(63) := 'device/ch2/meas_u';
+    tCh2_dbgAo   : STRING(63) := 'device/ch2/dbg/ao';
+
+    // ---- kanal 3 ----
+    tCh3_cmd_set : STRING(63) := 'device/ch3/cmd/set_u';
+    tCh3_set     : STRING(63) := 'device/ch3/set_u';
+    tCh3_meas    : STRING(63) := 'device/ch3/meas_u';
+    tCh3_dbgAo   : STRING(63) := 'device/ch3/dbg/ao';
+
+    // ==========================================================
+    // 6) RX-PUFFER FÜR MQTT
+    // ==========================================================
+    rxTopic   : STRING(128);  // hier landet das topic der letzten nachricht
+    rxPayload : STRING(128);  // hier landet der payload (z.b. "123.4")
+
+    // ==========================================================
+    // 7) HILFSVARIABLEN
+    // ==========================================================
+    tmpL  : LREAL;  // allgemeiner hilfswert für rechnen
+    tmpU  : LREAL;  // hilfswert für ai -> volt
+
+    // timer für 1 Hz telemetrie
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+// =====================================================================
+// A) MQTT INITIALISIERUNG
+// =====================================================================
+
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+
+    // queue mit client verbinden
+    fbMqttClient.ipMessageQueue := fbMessageQueue;
+
+    // TODO: hier deinen broker eintragen
+    fbMqttClient.sHostName := '192.168.0.20';   // ip / hostname broker
+    fbMqttClient.nHostPort := 1883;            // port broker
+    fbMqttClient.sClientId := 'cx7080-template'; // eindeutige client-id
+
+    // wenn du user/pass oder tls brauchst -> hier noch weitere parameter setzen (braucht man eigentlich nicht)
+END_IF;
+
+// client zyklisch laufen lassen
+fbMqttClient.Execute(TRUE);
+
+
+// =====================================================================
+// B) MQTT SUBSCRIPTIONS (nur einmal!!!!!! nach erfolgreichem connect)
+// =====================================================================
+
+IF fbMqttClient.bConnected AND NOT bSubsDone THEN
+    // TODO: für jeden kanal das command-topic abonnieren
+    fbMqttClient.Subscribe(tCh1_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(tCh2_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(tCh3_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+
+    bSubsDone := TRUE;
+END_IF;
+
+
+// =====================================================================
+// C) MQTT RX – EINGEHENDE KOMMANDOS VERARBEITEN
+// =====================================================================
+
+IF fbMessageQueue.nQueuedMessages > 0 THEN
+    IF fbMessageQueue.Dequeue(fbMessage := fbMessage) THEN
+        // topic und payload in strings holen
+        fbMessage.GetTopic(
+            pTopic     := ADR(rxTopic),
+            nTopicSize := SIZEOF(rxTopic)
+        );
+        fbMessage.GetPayload(
+            pPayload            := ADR(rxPayload),
+            nPayloadSize        := SIZEOF(rxPayload),
+            bSetNullTermination := TRUE
+        );
+
+        // jetzt pro kanal schauen, ob das topic passt
+        // payload wird als ASCII-zahl erwartet (z.b. "123.4")
+
+        // kanal 1
+        IF fbMessage.CompareTopic(sTopic := tCh1_cmd_set) THEN
+            Set_Ch1_U := LIMIT(0.0, STRING_TO_LREAL(rxPayload), Ch1_U_MAX);
+
+        // kanal 2
+        ELSIF fbMessage.CompareTopic(sTopic := tCh2_cmd_set) THEN
+            Set_Ch2_U := LIMIT(0.0, STRING_TO_LREAL(rxPayload), Ch2_U_MAX);
+
+        // kanal 3
+        ELSIF fbMessage.CompareTopic(sTopic := tCh3_cmd_set) THEN
+            Set_Ch3_U := LIMIT(0.0, STRING_TO_LREAL(rxPayload), Ch3_U_MAX);
+        END_IF
+    END_IF
+END_IF;
+
+
+// =====================================================================
+// D) AO-SKALIERUNG: SOLLWERTE (V) -> DAC-COUNTS (0..32767)
+//     standardfall: 0..U_MAX -> 0..10 V -> 0..32767
+// =====================================================================
+
+// kanal 1
+Set_Ch1_U := LIMIT(0.0, Set_Ch1_U, Ch1_U_MAX);       // sicherstellen: 0..Ch1_U_MAX
+tmpL      := (Set_Ch1_U * AO_FULL_SCALE) / Ch1_U_MAX; // 0..32767
+tmpL      := LIMIT(0.0, tmpL, AO_FULL_SCALE);
+AO_Ch1    := LREAL_TO_INT(tmpL);
+
+// kanal 2
+Set_Ch2_U := LIMIT(0.0, Set_Ch2_U, Ch2_U_MAX);
+tmpL      := (Set_Ch2_U * AO_FULL_SCALE) / Ch2_U_MAX;
+tmpL      := LIMIT(0.0, tmpL, AO_FULL_SCALE);
+AO_Ch2    := LREAL_TO_INT(tmpL);
+
+// kanal 3
+Set_Ch3_U := LIMIT(0.0, Set_Ch3_U, Ch3_U_MAX);
+tmpL      := (Set_Ch3_U * AO_FULL_SCALE) / Ch3_U_MAX;
+tmpL      := LIMIT(0.0, tmpL, AO_FULL_SCALE);
+AO_Ch3    := LREAL_TO_INT(tmpL);
+
+// wenn ein kanal z.b. nur 0..5 V am ausgang nutzen soll (wie bei den kleinen delta Netzteilen Vprog),
+// dann musst du die formel wie im delta-beispiel anpassen:
+// tmpL := Set_X * AO_FULL_SCALE / (2.0 * U_MAX);  // weil nur halbe 10V-range
+
+
+
+// =====================================================================
+// E) AI-SKALIERUNG: ADC-COUNTS (0..32767) -> ISTWERTE IN V
+//     standardfall: 0..10 V -> 0..U_MAX
+// =====================================================================
+
+// kanal 1
+tmpU := MAX(0.0, INT_TO_LREAL(AI_Ch1));          // rohwert -> LREAL, negative abschneiden
+tmpU := LIMIT(0.0, tmpU, AI_FULL_SCALE);         // 0..32767
+tmpU := tmpU / AI_FULL_SCALE * AI_RANGE_V;       // 0..10 V
+Read_Ch1_U := tmpU * (Ch1_U_MAX / AI_RANGE_V);   // 0..U_MAX (wenn AI_RANGE_V=10 -> faktor Ch1_U_MAX/10)
+
+// kanal 2
+tmpU := MAX(0.0, INT_TO_LREAL(AI_Ch2));
+tmpU := LIMIT(0.0, tmpU, AI_FULL_SCALE);
+tmpU := tmpU / AI_FULL_SCALE * AI_RANGE_V;
+Read_Ch2_U := tmpU * (Ch2_U_MAX / AI_RANGE_V);
+
+// kanal 3
+tmpU := MAX(0.0, INT_TO_LREAL(AI_Ch3));
+tmpU := LIMIT(0.0, tmpU, AI_FULL_SCALE);
+tmpU := tmpU / AI_FULL_SCALE * AI_RANGE_V;
+Read_Ch3_U := tmpU * (Ch3_U_MAX / AI_RANGE_V);
+
+// wenn dein readback z.b. nur 0..5 V ist (delta Vmon), dann änderst du die
+// multiplikation wie im alten code: faktor DEV_V_MAX / 5.0 etc.
+
+
+
+// =====================================================================
+// F) 1x/S TELEMETRIE-PUBLISH PRO KANAL
+// =====================================================================
+
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);   // timer resetten
+
+    IF fbMqttClient.bConnected THEN
+        // ---------- kanal 1 ----------
+        // sollwert publishen
+        sBuf  := LREAL_TO_STRING(Set_Ch1_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // istwert publishen
+        sBuf  := LREAL_TO_STRING(Read_Ch1_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh1_meas, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // debug counts
+        sBuf  := UDINT_TO_STRING(TO_UDINT(AO_Ch1));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh1_dbgAo, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- kanal 2 ----------
+        sBuf  := LREAL_TO_STRING(Set_Ch2_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh2_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf  := LREAL_TO_STRING(Read_Ch2_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh2_meas, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf  := UDINT_TO_STRING(TO_UDINT(AO_Ch2));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh2_dbgAo, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- kanal 3 ----------
+        sBuf  := LREAL_TO_STRING(Set_Ch3_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh3_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf  := LREAL_TO_STRING(Read_Ch3_U);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh3_meas, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf  := UDINT_TO_STRING(TO_UDINT(AO_Ch3));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tCh3_dbgAo, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF

@@ -1,0 +1,223 @@
+PROGRAM MAIN
+VAR
+    // ========= SOLLWERTE (in Volt) =========
+    // PSU1: Delta ES 030-5 (0..30 V, Vprog 0..5 V)
+    // PSU2: Delta ES 075-2 (0..75 V, Vprog 0..5 V)
+    // Beide Sollwerte können via MQTT gesetzt werden (siehe Receive-Block).
+    SetV1_V : LREAL := 0.0;   // Sollspannung PSU1
+    SetV2_V : LREAL := 0.0;   // Sollspannung PSU2
+
+    // ========= I/O-ROHWERTE (TwinCAT I/O-Mapping anpassen!) =========
+    // EL4104: Analogausgänge INT 0..32767 entsprechen 0..10 V am Ausgang.
+    AO1_Vset AT %Q* : INT;    // AO1 -> PSU1 Vprog (Pin 11)
+    AO2_Vset AT %Q* : INT;    // AO2 -> PSU2 Vprog (Pin 11)
+
+    // EL3164: Analogeingänge INT 0..32767 entsprechen 0..10 V am Eingang.
+    // Hier lesen wir Vmon der beiden Netzteile (0..5 V) ein.
+    AI1_Vmon AT %I* : INT;    // AI1 <- PSU1 Vmon (Pin 10)
+    AI2_Vmon AT %I* : INT;    // AI2 <- PSU2 Vmon (Pin 10)
+
+    // ========= PARAMETER / SKALIERUNG =========
+    // Gerätespezifische Maximalspannungen (für Clamps & Skalierung)
+    DEV1_V_MAX    : LREAL := 30.0;  // ES 030-5
+    DEV2_V_MAX    : LREAL := 75.0;  // ES 075-2
+
+    // Programmierspannung & Monitorbereich der Delta-PSUs
+    VPROG_RANGE_V : LREAL := 5.0;   // Vprog 0..5 V -> 0..Fullscale am Ausgang
+    VMON_RANGE_V  : LREAL := 5.0;   // Vmon  0..5 V <- skaliert mit Ausgang
+
+    // Beckhoff Kartenbereiche (für Rohwert↔Volt)
+    AO_RANGE_V    : LREAL := 10.0;  // EL4104 0..10 V
+    AI_RANGE_V    : LREAL := 10.0;  // EL3164 0..10 V
+
+    // Vollskalen-Rohwerte
+    AO_FULL_SCALE : LREAL := 32767.0;
+    AI_FULL_SCALE : LREAL := 32767.0;
+
+    // ========= BERECHNETE ISTWERTE (in Volt) =========
+    MeasV1_V : LREAL;  // aus Vmon PSU1 rekonstruiert
+    MeasV2_V : LREAL;  // aus Vmon PSU2 rekonstruiert
+
+    // ========= MQTT (MQTT 3.1.1 Client + Message Queue) =========
+    fbMqttClient   : FB_IotMqttClient;        // MQTT 3.1.1 Client
+    fbMessageQueue : FB_IotMqttMessageQueue;  // Queue für eingehende Messages
+    fbMessage      : FB_IotMqttMessage;       // einzelne empfangene Nachricht
+
+    bMqttInit      : BOOL := TRUE;
+    bSubsDone      : BOOL := FALSE;           // Subscriptions wurden registriert
+
+    // Publish-Puffer
+    sBuf   : STRING(128);
+    nSize  : UDINT;
+
+    // Telemetrie-Topics (werden 1x/s publiziert)
+    t1_set : STRING(63) := 'psu/1/set_v';   // aktueller Sollwert PSU1 (Volt)
+    t1_mev : STRING(63) := 'psu/1/meas_v';  // gemessene Ausgangsspannung PSU1 (Volt)
+    t2_set : STRING(63) := 'psu/2/set_v';   // aktueller Sollwert PSU2 (Volt)
+    t2_mev : STRING(63) := 'psu/2/meas_v';  // gemessene Ausgangsspannung PSU2 (Volt)
+
+    // Diagnose-Topics (optional)
+    t_dbg_ao1 : STRING(63) := 'psu/dbg/ao1_counts';
+    t_dbg_ao2 : STRING(63) := 'psu/dbg/ao2_counts';
+
+    // Kommando-Topics (EINGANG) zum Setzen der Sollwerte (ASCII-Volt, z. B. "12.5")
+    t1_cmd_set : STRING(63) := 'psu/1/cmd/set_v';
+    t2_cmd_set : STRING(63) := 'psu/2/cmd/set_v';
+
+    // Empfangspuffer
+    rxTopic   : STRING(128);
+    rxPayload : STRING(128);
+
+    // ========= HILFSWERTE =========
+    _aoRaw : LREAL;   // Zwischenergebnis für AO-Counts
+    _v     : LREAL;   // Hilfswert AI->Volt (0..10 V vor Rückskalierung)
+
+    // 1-Hz-Taktgeber für Telemetrie-Publish
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+
+
+
+
+
+// ======================== MQTT INITIALISIERUNG ========================
+// Einmalige Initialisierung: Client konfigurieren und Message-Queue binden
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+
+    // WICHTIG: Zuerst Queue am Client registrieren, dann Execute() zyklisch aufrufen.
+    fbMqttClient.ipMessageQueue := fbMessageQueue;
+
+    fbMqttClient.sHostName := '192.168.0.20';  // Broker-IP anpassen
+    fbMqttClient.nHostPort := 1883;            // MQTT-Port
+    fbMqttClient.sClientId := 'cx7080-psu12';  // Eindeutige Client-ID
+END_IF;
+
+// Client ausführen (Auf-/Abbau, IO). Muss ZYKLISCH true bekommen.
+fbMqttClient.Execute(TRUE);
+
+// Subscriptions erst nach erfolgreicher Verbindung setzen (robuster bei Reconnects)
+IF fbMqttClient.bConnected AND NOT bSubsDone THEN
+    fbMqttClient.Subscribe(t1_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(t2_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    bSubsDone := TRUE;
+END_IF;
+
+
+// ======================== EINGEHENDE KOMMANDOS (Message-Queue) ========================
+// Wir arbeiten "pull-basiert": Liegen Nachrichten in der Queue, holen wir sie per Dequeue().
+IF fbMessageQueue.nQueuedMessages > 0 THEN
+    IF fbMessageQueue.Dequeue(fbMessage := fbMessage) THEN
+        // Topic & Payload in unsere Strings kopieren (Nullterminierung aktivieren)
+        fbMessage.GetTopic(   pTopic := ADR(rxTopic),    nTopicSize := SIZEOF(rxTopic));
+        fbMessage.GetPayload( pPayload := ADR(rxPayload), nPayloadSize := SIZEOF(rxPayload), bSetNullTermination := TRUE);
+
+        // Einfacher Befehlsparser: zwei Topics, Payload ist ASCII-Zahl (Dezimalpunkt)
+        IF fbMessage.CompareTopic(sTopic := t1_cmd_set) THEN
+            // Ungültige Strings werden von STRING_TO_LREAL als 0.0 interpretiert;
+            // der LIMIT-Klemmblock verhindert Werte außerhalb 0..DEV*_V_MAX.
+            SetV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV1_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := t2_cmd_set) THEN
+            SetV2_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV2_V_MAX);
+        END_IF
+    END_IF
+END_IF;
+
+
+// ======================== AO-SKALIERUNG & AUSGABE ========================
+// Herleitung (allgemein):
+//  Vprog = (SollV / DEV_V_MAX) * 5 V
+//  EL4104: counts = (Vprog / 10 V) * 32767
+//  => counts = (SollV * 32767) / (2 * DEV_V_MAX)
+
+// PSU1 (0..30 V)
+SetV1_V := LIMIT(0.0, SetV1_V, DEV1_V_MAX);
+_aoRaw  := (SetV1_V * AO_FULL_SCALE) / (2.0 * DEV1_V_MAX); // = SetV1_V * 32767 / 60
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO1_Vset := LREAL_TO_INT(_aoRaw);
+
+// PSU2 (0..75 V)
+SetV2_V := LIMIT(0.0, SetV2_V, DEV2_V_MAX);
+_aoRaw  := (SetV2_V * AO_FULL_SCALE) / (2.0 * DEV2_V_MAX); // = SetV2_V * 32767 / 150
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO2_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// ======================== AI -> ENGINEERING ========================
+// EL3164: V_ai = counts/32767 * 10 V (0..10 V)
+// Delta Vmon: 0..5 V -> Vout = Vmon * (DEV_V_MAX / 5)
+
+// PSU1 Mess-Spannung
+_v := MAX(0.0, INT_TO_LREAL(AI1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V; // jetzt 0..10 V
+MeasV1_V := _v * (DEV1_V_MAX / VMON_RANGE_V);                         // 0..5 V * (30/5) = 0..30 V
+
+// PSU2 Mess-Spannung
+_v := MAX(0.0, INT_TO_LREAL(AI2_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasV2_V := _v * (DEV2_V_MAX / VMON_RANGE_V);                         // 0..5 V * (75/5) = 0..75 V
+
+
+// ======================== 1x/S TELEMETRIE PUBLISH ========================
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);
+
+    IF fbMqttClient.bConnected THEN
+        // ---- PSU1 ----
+        // Aktueller Sollwert (Volt)
+        sBuf := LREAL_TO_STRING(SetV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Gemessene Ausgangsspannung (Volt) aus Vmon rekonstruiert
+        sBuf := LREAL_TO_STRING(MeasV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Debug: Roh-Counts des AO (zum schnellen Gegencheck)
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- PSU2 ----
+        sBuf := LREAL_TO_STRING(SetV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO2_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF
+
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+MQTT COMMANDS (RUN IN FOLDER (POWERSHELL WORKS BEST)):
+
+
+# PSU1 auf 10 V setzen
+.\mosquitto_pub.exe -h 192.168.0.20 -p 1883 -V mqttv311 -t "psu/1/cmd/set_v" -m "10"
+
+# PSU2 auf 48 V setzen
+.\mosquitto_pub.exe -h 192.168.0.20 -p 1883 -V mqttv311 -t "psu/2/cmd/set_v" -m "48"
+
+# Telemetrie mitlesen (Soll + Ist)
+.\mosquitto_sub.exe -h 192.168.0.20 -p 1883 -V mqttv311 -t "psu/#" -v

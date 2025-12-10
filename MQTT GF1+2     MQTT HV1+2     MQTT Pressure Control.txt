@@ -1,0 +1,310 @@
+PROGRAM MAIN
+VAR
+    // ========= SOLLWERTE (in Volt) =========
+    // Delta ES 030-5 (0..30 V, Vprog 0..5 V, AO nutzt 0..10 V -> nur untere Hälfte)
+    // Delta ES 075-2 (0..75 V, Vprog 0..5 V, AO nutzt 0..10 V -> nur untere Hälfte)
+    // FuG HCN 7E-6500 (0..6500 V, U_set 0..10 V)
+    // Pressure control (0..10 V direkt)
+    SetV1_V     : LREAL := 0.0;    // PSU1 (ES 030-5)
+    SetV2_V     : LREAL := 0.0;    // PSU2 (ES 075-2)
+    SetV_HV1_V  : LREAL := 0.0;    // HV1  (HCN 7E-6500)
+    SetV_HV4_V  : LREAL := 0.0;    // HV4  (HCN 7E-6500)
+    SetP_V      : LREAL := 0.0;    // Pressure control (0..10 V)
+
+    // ========= I/O-ROHWERTE (TwinCAT I/O-Mapping anpassen!) =========
+    // EL4104 AO: INT 0..32767 => 0..10 V
+    AO1_Vset       AT %Q* : INT;   // AO -> PSU1 Vprog
+    AO2_Vset       AT %Q* : INT;   // AO -> PSU2 Vprog
+    AO3_HV1_Vset   AT %Q* : INT;   // AO -> HV1  U_set (0..10 V)
+    AO4_HV4_Vset   AT %Q* : INT;   // AO -> HV4  U_set (0..10 V)
+    AO_P_Vset      AT %Q* : INT;   // AO -> Pressure control 0..10 V
+
+    // EL3164 AI: INT 0..32767 <= 0..10 V
+    AI1_Vmon       AT %I* : INT;   // <- PSU1 Vmon  (0..5 V)
+    AI2_Vmon       AT %I* : INT;   // <- PSU2 Vmon  (0..5 V)
+    AI_HV1_Vmon    AT %I* : INT;   // <- HV1  U_mon (0..10 V)
+    AI_HV1_Imon    AT %I* : INT;   // <- HV1  I_mon (0..10 V)
+    AI_HV4_Vmon    AT %I* : INT;   // <- HV4  U_mon (0..10 V)
+    AI_HV4_Imon    AT %I* : INT;   // <- HV4  I_mon (0..10 V)
+    AI_P_Vfb       AT %I* : INT;   // <- Pressure control Readback (0..10 V)
+
+    // ========= PARAMETER / SKALIERUNG =========
+    // Delta-Geräte
+    DEV1_V_MAX     : LREAL := 30.0;     // ES 030-5
+    DEV2_V_MAX     : LREAL := 75.0;     // ES 075-2
+    VPROG_RANGE_V  : LREAL := 5.0;      // Delta Vprog 0..5 V
+    VMON_RANGE_V   : LREAL := 5.0;      // Delta Vmon  0..5 V
+
+    // HCN-Geräte
+    DEVHV_V_MAX    : LREAL := 6500.0;   // 0..6500 V
+    DEVHV_I_MAX_mA : LREAL := 1.0;      // 0..1 mA
+    HV_USET_RANGE  : LREAL := 10.0;     // U_set  0..10 V
+    HV_MON_RANGE   : LREAL := 10.0;     // U/I_mon 0..10 V
+
+    // Pressure control
+    P_V_MAX        : LREAL := 10.0;     // 0..10 V Soll/Readback
+
+    // Beckhoff Kartenbereiche
+    AO_RANGE_V     : LREAL := 10.0;     // EL4104 0..10 V
+    AI_RANGE_V     : LREAL := 10.0;     // EL3164 0..10 V
+
+    // Vollskalen-Rohwerte
+    AO_FULL_SCALE  : LREAL := 32767.0;
+    AI_FULL_SCALE  : LREAL := 32767.0;
+
+    // ========= BERECHNETE ISTWERTE =========
+    MeasV1_V      : LREAL;  // Delta PSU1: 0..30 V
+    MeasV2_V      : LREAL;  // Delta PSU2: 0..75 V
+    MeasU_HV1_V   : LREAL;  // HV1:  0..6500 V
+    MeasI_HV1_mA  : LREAL;  // HV1:  0..1 mA
+    MeasU_HV4_V   : LREAL;  // HV4:  0..6500 V
+    MeasI_HV4_mA  : LREAL;  // HV4:  0..1 mA
+    MeasP_V       : LREAL;  // Pressure control Readback 0..10 V
+
+    // ========= MQTT (MQTT 3.1.1 Client + Message Queue) =========
+    fbMqttClient   : FB_IotMqttClient;
+    fbMessageQueue : FB_IotMqttMessageQueue;
+    fbMessage      : FB_IotMqttMessage;
+    bMqttInit      : BOOL := TRUE;
+    bSubsDone      : BOOL := FALSE;
+
+    // Publish-Puffer
+    sBuf  : STRING(128);
+    nSize : UDINT;
+
+    // Delta Telemetrie
+    t1_set : STRING(63) := 'psu/1/set_v';
+    t1_mev : STRING(63) := 'psu/1/meas_v';
+    t2_set : STRING(63) := 'psu/2/set_v';
+    t2_mev : STRING(63) := 'psu/2/meas_v';
+
+    // HV Telemetrie
+    thv1_set  : STRING(63) := 'hv/1/set_v';
+    thv1_mev  : STRING(63) := 'hv/1/meas_v';
+    thv1_mei  : STRING(63) := 'hv/1/meas_i_mA';
+    thv4_set  : STRING(63) := 'hv/4/set_v';
+    thv4_mev  : STRING(63) := 'hv/4/meas_v';
+    thv4_mei  : STRING(63) := 'hv/4/meas_i_mA';
+
+    // Pressure Telemetrie
+    tP_set    : STRING(63) := 'pressure/set_v';      // Sollwert (0..10 V)
+    tP_mev    : STRING(63) := 'pressure/meas_v';     // Readback (0..10 V)
+
+    // Debug
+    t_dbg_ao1 : STRING(63) := 'psu/dbg/ao1_counts';
+    t_dbg_ao2 : STRING(63) := 'psu/dbg/ao2_counts';
+    t_dbg_ao3 : STRING(63) := 'hv/dbg/ao3_counts';
+    t_dbg_ao4 : STRING(63) := 'hv/dbg/ao4_counts';
+    t_dbg_aoP : STRING(63) := 'pressure/dbg/ao_counts';
+
+    // Kommandos (EINGANG) – Sollwerte setzen
+    t1_cmd_set    : STRING(63) := 'psu/1/cmd/set_v';
+    t2_cmd_set    : STRING(63) := 'psu/2/cmd/set_v';
+    thv1_cmd_set  : STRING(63) := 'hv/1/cmd/set_v';
+    thv4_cmd_set  : STRING(63) := 'hv/4/cmd/set_v';
+    tP_cmd_set    : STRING(63) := 'pressure/cmd/set_v';
+
+    // Empfangspuffer
+    rxTopic   : STRING(128);
+    rxPayload : STRING(128);
+
+    // ========= HILFSWERTE =========
+    _aoRaw : LREAL;   // Zwischenergebnis AO-Counts
+    _v     : LREAL;   // Hilfswert AI->Volt (0..10 V)
+
+    // 1-Hz-Taktgeber für Telemetrie-Publish
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+// ======================== MQTT INITIALISIERUNG ========================
+// Einmalig: Queue binden, Client parametrieren
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+
+    fbMqttClient.ipMessageQueue := fbMessageQueue;  // Queue an Client binden
+
+    fbMqttClient.sHostName := '192.168.0.20';
+    fbMqttClient.nHostPort := 1883;
+    fbMqttClient.sClientId := 'cx7080-psu12-hv14-pressure';
+END_IF;
+
+// Zyklisch: Client ausführen
+fbMqttClient.Execute(TRUE);
+
+// Subscriptions erst nach Connect (robust bei Reconnect)
+IF fbMqttClient.bConnected AND NOT bSubsDone THEN
+    fbMqttClient.Subscribe(t1_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(t2_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(thv1_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(thv4_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(tP_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    bSubsDone := TRUE;
+END_IF;
+
+
+// ======================== EINGEHENDE KOMMANDOS (MQTT RX) ========================
+// Nachrichten aus Queue ziehen, Topic vergleichen, Payload (ASCII-Zahl) übernehmen
+IF fbMessageQueue.nQueuedMessages > 0 THEN
+    IF fbMessageQueue.Dequeue(fbMessage := fbMessage) THEN
+        fbMessage.GetTopic(  pTopic := ADR(rxTopic),    nTopicSize := SIZEOF(rxTopic));
+        fbMessage.GetPayload(pPayload := ADR(rxPayload), nPayloadSize := SIZEOF(rxPayload), bSetNullTermination := TRUE);
+
+        IF fbMessage.CompareTopic(sTopic := t1_cmd_set) THEN
+            SetV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV1_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := t2_cmd_set) THEN
+            SetV2_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV2_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := thv1_cmd_set) THEN
+            SetV_HV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := thv4_cmd_set) THEN
+            SetV_HV4_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := tP_cmd_set) THEN
+            // Pressure control direkt 0..10 V
+            SetP_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), P_V_MAX);
+        END_IF
+    END_IF
+END_IF;
+
+
+// ======================== AO-SKALIERUNG & AUSGABE ========================
+// Delta ES*** (Vprog 0..5 V):
+//   Vprog = (SollV / DEV_V_MAX) * 5 V
+//   counts = (Vprog / 10 V) * 32767 = SollV * 32767 / (2 * DEV_V_MAX)
+
+// PSU1 (0..30 V)
+SetV1_V := LIMIT(0.0, SetV1_V, DEV1_V_MAX);
+_aoRaw  := (SetV1_V * AO_FULL_SCALE) / (2.0 * DEV1_V_MAX);  // = *32767/60
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO1_Vset := LREAL_TO_INT(_aoRaw);
+
+// PSU2 (0..75 V)
+SetV2_V := LIMIT(0.0, SetV2_V, DEV2_V_MAX);
+_aoRaw  := (SetV2_V * AO_FULL_SCALE) / (2.0 * DEV2_V_MAX);  // = *32767/150
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO2_Vset := LREAL_TO_INT(_aoRaw);
+
+// FuG HCN (U_set 0..10 V):
+//   U_set = (SollV / 6500 V) * 10 V
+//   counts = (U_set / 10 V) * 32767 = SollV * 32767 / 6500
+
+// HV1 (0..6500 V)
+SetV_HV1_V := LIMIT(0.0, SetV_HV1_V, DEVHV_V_MAX);
+_aoRaw     := (SetV_HV1_V * AO_FULL_SCALE) / DEVHV_V_MAX;   // = *32767/6500
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO3_HV1_Vset := LREAL_TO_INT(_aoRaw);
+
+// HV4 (0..6500 V)
+SetV_HV4_V := LIMIT(0.0, SetV_HV4_V, DEVHV_V_MAX);
+_aoRaw     := (SetV_HV4_V * AO_FULL_SCALE) / DEVHV_V_MAX;
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO4_HV4_Vset := LREAL_TO_INT(_aoRaw);
+
+// Pressure control (0..10 V direkt):
+//   counts = (SetP_V / 10 V) * 32767
+SetP_V := LIMIT(0.0, SetP_V, P_V_MAX);
+_aoRaw := (SetP_V / AO_RANGE_V) * AO_FULL_SCALE;
+_aoRaw := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO_P_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// ======================== AI -> ENGINEERING ========================
+// EL3164: U_ai = counts/32767 * 10 V (0..10 V)
+
+// Delta PSU1 (Vmon 0..5 V → 0..30 V)
+_v := MAX(0.0, INT_TO_LREAL(AI1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;   // 0..10 V
+MeasV1_V := _v * (DEV1_V_MAX / VMON_RANGE_V);                           // * (30/5) = *6
+
+// Delta PSU2 (Vmon 0..5 V → 0..75 V)
+_v := MAX(0.0, INT_TO_LREAL(AI2_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasV2_V := _v * (DEV2_V_MAX / VMON_RANGE_V);                           // * (75/5) = *15
+
+// HV1: U_mon 0..10 V → 0..6500 V   ;  I_mon 0..10 V → 0..1 mA
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasU_HV1_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);                       // * (6500/10)
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Imon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasI_HV1_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);                   // * (1/10)
+
+// HV4: U_mon 0..10 V → 0..6500 V   ;  I_mon 0..10 V → 0..1 mA
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasU_HV4_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Imon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasI_HV4_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);
+
+// Pressure Readback 0..10 V direkt
+_v := MAX(0.0, INT_TO_LREAL(AI_P_Vfb)) / AI_FULL_SCALE * AI_RANGE_V;    // 0..10 V
+MeasP_V := _v;                                                          // direkt 1:1
+
+
+// ======================== 1x/S TELEMETRIE PUBLISH ========================
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);
+
+    IF fbMqttClient.bConnected THEN
+        // ---- Delta PSU1 ----
+        sBuf := LREAL_TO_STRING(SetV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- Delta PSU2 ----
+        sBuf := LREAL_TO_STRING(SetV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO2_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- HV1 ----
+        sBuf := LREAL_TO_STRING(SetV_HV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasU_HV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasI_HV1_mA); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mei, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO3_HV1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao3, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- HV4 ----
+        sBuf := LREAL_TO_STRING(SetV_HV4_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasU_HV4_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := LREAL_TO_STRING(MeasI_HV4_mA); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mei, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO4_HV4_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao4, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- Pressure control ----
+        sBuf := LREAL_TO_STRING(SetP_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasP_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO_P_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_aoP, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF
+
+
+
+
+
+
+commands: (nur neue):
+
+
+
+# Setzen (0..10 V)
+.\mosquitto_pub.exe -h 192.168.0.20 -p 1883 -V mqttv311 -t "pressure/cmd/set_v" -m "5.0"
+
+# Lesen
+.\mosquitto_sub.exe -h 192.168.0.20 -p 1883 -V mqttv311 -t "pressure/#" -v

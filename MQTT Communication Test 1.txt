@@ -1,0 +1,25 @@
+PROGRAM MAIN
+VAR
+	bRunOnlyOnce : BOOL := FALSE;
+END_VAR
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+
+
+IF NOT bRunOnlyOnce THEN
+	ADSLOGSTR(msgCtrlMask := ADSLOG_MSGTYPE_ERROR OR ADSLOG_MSGTYPE_LOG,
+		msgFmtStr := 'Hello World from sctratch test',
+		strArg := '');
+		bRunOnlyOnce := TRUE;
+END_IF

@@ -1,0 +1,91 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="MAIN" Id="{dea494cb-cd23-4870-9828-7e4d7e861199}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    PROGRAM MAIN
+
+    Zweck:
+    - Läuft in einer schnellen Task (z.B. 5 ms).
+    - Rechnet nur:
+        * Sollwerte (V) -> AO-Rohwerte (INT)
+        * AI-Rohwerte (INT) -> Istwerte (V)
+    - Die Sollwerte kommen u.a. von MQTT (PRG_IoT), liegen aber in GVL_PowerIo.
+*)
+
+PROGRAM MAIN
+VAR
+    _aoRaw : LREAL;   // Zwischenergebnis AO-Counts
+    _v     : LREAL;   // Hilfswert AI->Volt (0..10 V)
+END_VAR
+]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ======================== AO-SKALIERUNG & AUSGABE ========================
+// Delta ES*** (Vprog 0..5 V):
+//   Vprog = (SollV / DEV_V_MAX) * 5 V
+//   counts = (Vprog / 10 V) * 32767 = SollV * 32767 / (2 * DEV_V_MAX)
+
+// PSU1 (0..30 V)
+SetV1_V := LIMIT(0.0, SetV1_V, DEV1_V_MAX);
+_aoRaw  := (SetV1_V * AO_FULL_SCALE) / (2.0 * DEV1_V_MAX);  // = *32767/60
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO1_Vset := LREAL_TO_INT(_aoRaw);
+
+// PSU2 (0..75 V)
+SetV2_V := LIMIT(0.0, SetV2_V, DEV2_V_MAX);
+_aoRaw  := (SetV2_V * AO_FULL_SCALE) / (2.0 * DEV2_V_MAX);  // = *32767/150
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO2_Vset := LREAL_TO_INT(_aoRaw);
+
+// FuG HCN (U_set 0..10 V):
+//   U_set = (SollV / 6500 V) * 10 V
+//   counts = (U_set / 10 V) * 32767 = SollV * 32767 / 6500
+
+// HV1 (0..6500 V)
+SetV_HV1_V := LIMIT(0.0, SetV_HV1_V, DEVHV_V_MAX);
+_aoRaw     := (SetV_HV1_V * AO_FULL_SCALE) / DEVHV_V_MAX;   // = *32767/6500
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO3_HV1_Vset := LREAL_TO_INT(_aoRaw);
+
+// HV4 (0..6500 V)
+SetV_HV4_V := LIMIT(0.0, SetV_HV4_V, DEVHV_V_MAX);
+_aoRaw     := (SetV_HV4_V * AO_FULL_SCALE) / DEVHV_V_MAX;
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO4_HV4_Vset := LREAL_TO_INT(_aoRaw);
+
+// Pressure control (0..10 V direkt):
+//   counts = (SetP_V / 10 V) * 32767
+SetP_V := LIMIT(0.0, SetP_V, P_V_MAX);
+_aoRaw := (SetP_V / AO_RANGE_V) * AO_FULL_SCALE;
+_aoRaw := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO_P_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// ======================== AI -> ENGINEERING ========================
+// EL3164: U_ai = counts/32767 * 10 V (0..10 V)
+
+// Delta PSU1 (Vmon 0..5 V → 0..30 V)
+_v := MAX(0.0, INT_TO_LREAL(AI1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;   // 0..10 V
+MeasV1_V := _v * (DEV1_V_MAX / VMON_RANGE_V);                           // * (30/5) = *6
+
+// Delta PSU2 (Vmon 0..5 V → 0..75 V)
+_v := MAX(0.0, INT_TO_LREAL(AI2_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasV2_V := _v * (DEV2_V_MAX / VMON_RANGE_V);                           // * (75/5) = *15
+
+// HV1: U_mon 0..10 V → 0..6500 V   ;  I_mon 0..10 V → 0..1 mA
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasU_HV1_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);                       // * (6500/10)
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Imon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasI_HV1_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);                   // * (1/10)
+
+// HV4: U_mon 0..10 V → 0..6500 V   ;  I_mon 0..10 V → 0..1 mA
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasU_HV4_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Imon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasI_HV4_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);
+
+// Pressure Readback 0..10 V direkt
+_v := MAX(0.0, INT_TO_LREAL(AI_P_Vfb)) / AI_FULL_SCALE * AI_RANGE_V;    // 0..10 V
+MeasP_V := _v;                                                          // direkt 1:1]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

@@ -1,0 +1,218 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <POU Name="PRG_IoT" Id="{1925058a-79f8-45a1-adc5-eec8b9c32eda}" SpecialFunc="None">
+    <Declaration><![CDATA[(*
+    PROGRAM PRG_IoT
+
+    Zweck:
+    - Läuft in einer eigenen Task, z.B. 10 ms Zykluszeit.
+    - Kapselt ALLES, was MQTT betrifft (Init, RX, TX).
+    - Greift auf globale Variablen aus GVL_PowerIo zu:
+        SetV*_V, MeasV*_V, AO*_Vset, usw.
+    - Telemetrie: ca. 10 Hz via TON mit PT = 100 ms.
+*)
+
+PROGRAM PRG_IoT
+VAR
+    // ========= MQTT CLIENT & QUEUE =========
+    fbMqttClient   : FB_IotMqttClient;
+    fbMessageQueue : FB_IotMqttMessageQueue;
+    fbMessage      : FB_IotMqttMessage;
+    bMqttInit      : BOOL := TRUE;
+    bSubsDone      : BOOL := FALSE;
+
+    // Publish-Puffer
+    sBuf  : STRING(128);
+    nSize : UDINT;
+
+    // Topics – wie in deinem ursprünglichen Code
+    // Delta Telemetrie
+    t1_set : STRING(63) := 'psu/1/set_v';
+    t1_mev : STRING(63) := 'psu/1/meas_v';
+    t2_set : STRING(63) := 'psu/2/set_v';
+    t2_mev : STRING(63) := 'psu/2/meas_v';
+
+    // HV Telemetrie
+    thv1_set  : STRING(63) := 'hv/1/set_v';
+    thv1_mev  : STRING(63) := 'hv/1/meas_v';
+    thv1_mei  : STRING(63) := 'hv/1/meas_i_mA';
+    thv4_set  : STRING(63) := 'hv/4/set_v';
+    thv4_mev  : STRING(63) := 'hv/4/meas_v';
+    thv4_mei  : STRING(63) := 'hv/4/meas_i_mA';
+
+    // Pressure Telemetrie
+    tP_set    : STRING(63) := 'pressure/set_v';
+    tP_mev    : STRING(63) := 'pressure/meas_v';
+
+    // Debug
+    t_dbg_ao1 : STRING(63) := 'psu/dbg/ao1_counts';
+    t_dbg_ao2 : STRING(63) := 'psu/dbg/ao2_counts';
+    t_dbg_ao3 : STRING(63) := 'hv/dbg/ao3_counts';
+    t_dbg_ao4 : STRING(63) := 'hv/dbg/ao4_counts';
+    t_dbg_aoP : STRING(63) := 'pressure/dbg/ao_counts';
+
+    // Kommandos (EINGANG) – Sollwerte setzen
+    t1_cmd_set    : STRING(63) := 'psu/1/cmd/set_v';
+    t2_cmd_set    : STRING(63) := 'psu/2/cmd/set_v';
+    thv1_cmd_set  : STRING(63) := 'hv/1/cmd/set_v';
+    thv4_cmd_set  : STRING(63) := 'hv/4/cmd/set_v';
+    tP_cmd_set    : STRING(63) := 'pressure/cmd/set_v';
+
+    // Empfangspuffer
+    rxTopic   : STRING(128);
+    rxPayload : STRING(128);
+
+    // Taktgeber für Telemetrie (~10 Hz)
+    tickTelem : TON := (PT := T#100MS);
+END_VAR]]></Declaration>
+    <Implementation>
+      <ST><![CDATA[// ======================== MQTT INITIALISIERUNG ========================
+
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+
+    // Queue an Client binden
+    fbMqttClient.ipMessageQueue := fbMessageQueue;
+
+    // Broker-Parameter
+    fbMqttClient.sHostName := '192.168.0.20';
+    fbMqttClient.nHostPort := 1883;
+    fbMqttClient.sClientId := 'cx7080-psu12-hv14-pressure';
+END_IF;
+
+// Client zyklisch ausführen (Verbindung halten, Empfang etc.)
+fbMqttClient.Execute(TRUE);
+
+// Subscriptions nach erfolgreichem Connect setzen
+IF fbMqttClient.bConnected AND NOT bSubsDone THEN
+    fbMqttClient.Subscribe(t1_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(t2_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(thv1_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(thv4_cmd_set, TcIotMqttQos.AtMostOnceDelivery);
+    fbMqttClient.Subscribe(tP_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);
+    bSubsDone := TRUE;
+END_IF;
+
+
+// ======================== EINGEHENDE KOMMANDOS (MQTT RX) ========================
+
+IF fbMessageQueue.nQueuedMessages > 0 THEN
+    // hier verarbeitest du pro Zyklus eine Nachricht;
+    // bei 10 ms Task-Zeit wären das bis zu 100 Messages/s
+    IF fbMessageQueue.Dequeue(fbMessage := fbMessage) THEN
+        fbMessage.GetTopic(
+            pTopic     := ADR(rxTopic),
+            nTopicSize := SIZEOF(rxTopic)
+        );
+        fbMessage.GetPayload(
+            pPayload            := ADR(rxPayload),
+            nPayloadSize        := SIZEOF(rxPayload),
+            bSetNullTermination := TRUE
+        );
+
+        // Topic-Matching: Set-Sollwerte übernehmen
+        IF fbMessage.CompareTopic(sTopic := t1_cmd_set) THEN
+            SetV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV1_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := t2_cmd_set) THEN
+            SetV2_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV2_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := thv1_cmd_set) THEN
+            SetV_HV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := thv4_cmd_set) THEN
+            SetV_HV4_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        ELSIF fbMessage.CompareTopic(sTopic := tP_cmd_set) THEN
+            SetP_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), P_V_MAX);
+        END_IF
+    END_IF
+END_IF;
+
+
+// ======================== TELEMETRIE-PUBLISH (~10 Hz) ========================
+
+// TON läuft in dieser Task, PT = 100 ms => ~10 Hz
+tickTelem(IN := TRUE);
+
+IF tickTelem.Q THEN
+    tickTelem(IN := FALSE);   // Timer zurücksetzen
+
+    IF fbMqttClient.bConnected THEN
+        // ---- Delta PSU1 ----
+        sBuf := LREAL_TO_STRING(SetV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_set, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_mev, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao1, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- Delta PSU2 ----
+        sBuf := LREAL_TO_STRING(SetV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_set, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_mev, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO2_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao2, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- HV1 ----
+        sBuf := LREAL_TO_STRING(SetV_HV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_set, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasU_HV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mev, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasI_HV1_mA); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mei, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO3_HV1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao3, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- HV4 ----
+        sBuf := LREAL_TO_STRING(SetV_HV4_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_set, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasU_HV4_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mev, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasI_HV4_mA); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mei, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO4_HV4_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao4, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // ---- Pressure control ----
+        sBuf := LREAL_TO_STRING(SetP_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_set, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasP_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_mev, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO_P_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_aoP, ADR(sBuf), nSize,
+                             TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF]]></ST>
+    </Implementation>
+  </POU>
+</TcPlcObject>

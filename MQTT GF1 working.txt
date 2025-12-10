@@ -1,0 +1,115 @@
+PROGRAM MAIN
+VAR
+    // --------- SOLLWERTE (0..30 V) ----------
+    SetV1_V : LREAL := 0.0;   // PSU1
+
+    // --------- I/O-ROHWERTE (im I/O-Mapping verknüpfen!) ----------
+    // EL4104 Analogausgänge sind INT (0..32767 für 0..10V)
+    AO1_Vset AT %Q* : INT;    // EL4104 -> PSU1 Vprog
+
+    // EL3164 Analogeingänge sind INT (0..32767 für 0..10V)
+    AI1_Vmon AT %I* : INT;    // EL3164 <- PSU1 Vmon (0..5V)
+
+    // --------- PARAMETER / SKALIERUNG ----------
+    DEV_V_MAX      : LREAL := 30.0;     // 0..30 V am Ausgang
+
+    // Delta ES: Vprog 0..5 V -> 0..30 V
+    VPROG_RANGE_V  : LREAL := 5.0;
+
+    // Monitore liefern 0..5 V
+    VMON_RANGE_V   : LREAL := 5.0;
+
+    // Kartenbereiche
+    AO_RANGE_V     : LREAL := 10.0;     // EL4104 0..10 V
+    AI_RANGE_V     : LREAL := 10.0;     // EL3164 0..10 V
+
+    // Rohzählwerte
+    AO_FULL_SCALE  : LREAL := 32767.0;  // EL4104 Vollskala
+    AI_FULL_SCALE  : LREAL := 32767.0;  // EL3164 Vollskala
+
+    // --------- BERECHNETE ISTWERTE ----------
+    MeasV1_V : LREAL;
+
+    // --------- MQTT ----------
+    fbMqttClient : FB_IotMqttClient;
+    bMqttInit    : BOOL := TRUE;
+    sBuf         : STRING(64);
+    nSize        : UDINT;
+
+    t_set1  : STRING(63) := 'psu/1/set_v';
+    t_mev1  : STRING(63) := 'psu/1/meas_v';
+
+    // Diagnose
+    t_dbg_ao1 : STRING(63) := 'psu/dbg/ao1_counts';
+
+    // --------- HILFE ----------
+    _aoRaw : LREAL;             // Rechenhilfswert für AO
+    _v     : LREAL;             // Hilfswert AI->Volt
+
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+
+// ===== MQTT init (1x) =====
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+    fbMqttClient.sHostName := '192.168.0.20';
+    fbMqttClient.nHostPort := 1883;
+    fbMqttClient.sClientId := 'cx7080-psu1';
+END_IF;
+fbMqttClient.Execute(TRUE);
+
+
+// ===== PSU1: SetV -> AO (EL4104) =====
+// Clamp 0..30 V
+SetV1_V := LIMIT(0.0, SetV1_V, DEV_V_MAX);
+// Delta: Vprog = U/6; EL4104-Counts = V/10 * 32767
+// => Counts = (U/6)/10 * 32767 = U * 32767 / 60
+_aoRaw := (SetV1_V * AO_FULL_SCALE) / 60.0;
+// Sicherstellen 0..32767
+_aoRaw := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO1_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// ===== AI -> Engineering (EL3164) =====
+// EL3164: V_ai = counts/32767 * 10 V
+
+// PSU1 Mess-Spannung
+_v := MAX(0.0, INT_TO_LREAL(AI1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V; // 0..10 V
+MeasV1_V := _v * (DEV_V_MAX / VMON_RANGE_V);                          // × (30/5) = ×6
+
+
+// ===== 1x/s publish =====
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);
+
+    IF fbMqttClient.bConnected THEN
+        // Soll/Ist PSU1
+        sBuf := LREAL_TO_STRING(SetV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_set1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_mev1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Diagnose
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO1_Vset)); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF
+
+
+
+

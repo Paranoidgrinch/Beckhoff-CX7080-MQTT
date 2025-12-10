@@ -1,0 +1,16 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<TcPlcObject Version="1.1.0.1">
+  <Task Name="Task_IoT" Id="{e70ba66d-b6d1-4c5f-98fc-4fd7cf30ad10}">
+    <!--CycleTime in micro seconds.-->
+    <CycleTime>10000</CycleTime>
+    <Priority>30</Priority>
+    <PouCall>
+      <Name>PRG_IoT</Name>
+    </PouCall>
+    <TaskFBGuid>{cc79ca8a-d5f1-4afd-930e-f9e38b902db2}</TaskFBGuid>
+    <Fb_init>{253cf17d-844b-4ae6-a075-f4b0a27d9299}</Fb_init>
+    <Fb_exit>{cc12cd2d-bd24-43e2-95b4-0d141356ecba}</Fb_exit>
+    <CycleUpdate>{3211f2fc-581d-400c-bb08-502f0906d016}</CycleUpdate>
+    <PostCycleUpdate>{e7932755-41e1-4911-9b1b-10bb77cb8037}</PostCycleUpdate>
+  </Task>
+</TcPlcObject>

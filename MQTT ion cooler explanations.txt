@@ -1,0 +1,462 @@
+PROGRAM MAIN
+VAR
+    // -----------------------------
+    // 1) Sollwerte in Volt (Engineering)
+    // -----------------------------
+    // Vorgabewerte, mit denen du später rechnest.
+    // Alles in physikalischen Einheiten (V), nicht in Counts.
+    SetV1_V     : LREAL := 0.0;    // PSU1 (Delta ES 030-5, 0..30 V)
+    SetV2_V     : LREAL := 0.0;    // PSU2 (Delta ES 075-2, 0..75 V)
+    SetV_HV1_V  : LREAL := 0.0;    // HV1 (FuG HCN 7E-6500, 0..6500 V)
+    SetV_HV4_V  : LREAL := 0.0;    // HV4 (FuG HCN 7E-6500, 0..6500 V)
+    SetP_V      : LREAL := 0.0;    // Pressure control (0..10 V)
+
+    // -----------------------------
+    // 2) Rohwerte I/O (direkt am Prozessabbild)
+    // -----------------------------
+    // EL4104: AO 0..10 V -> INT 0..32767
+    // EL3164: AI 0..10 V -> INT 0..32767
+    // AT %Q* / %I* muss im Projekt noch auf echte Adressen (%QW0, %IW0, ...) gesetzt werden.
+
+    // Analog Out (EL4104)
+    AO1_Vset       AT %Q* : INT;   // AO zu PSU1, Vprog
+    AO2_Vset       AT %Q* : INT;   // AO zu PSU2, Vprog
+    AO3_HV1_Vset   AT %Q* : INT;   // AO zu HV1, U_set (0..10 V)
+    AO4_HV4_Vset   AT %Q* : INT;   // AO zu HV4, U_set (0..10 V)
+    AO_P_Vset      AT %Q* : INT;   // AO zur Pressure control (0..10 V)
+
+    // Analog In (EL3164)
+    AI1_Vmon       AT %I* : INT;   // Rücklesung PSU1 Vmon (0..5 V)
+    AI2_Vmon       AT %I* : INT;   // Rücklesung PSU2 Vmon (0..5 V)
+    AI_HV1_Vmon    AT %I* : INT;   // HV1 U_mon (0..10 V)
+    AI_HV1_Imon    AT %I* : INT;   // HV1 I_mon (0..10 V)
+    AI_HV4_Vmon    AT %I* : INT;   // HV4 U_mon (0..10 V)
+    AI_HV4_Imon    AT %I* : INT;   // HV4 I_mon (0..10 V)
+    AI_P_Vfb       AT %I* : INT;   // Pressure control Readback (0..10 V)
+
+    // -----------------------------
+    // 3) Parameter / Skalierung
+    // -----------------------------
+    // Alles, was du brauchst um von V -> Vprog/U_set -> Counts zu kommen
+    // und umgekehrt wieder zurückzurechnen.
+
+    // Delta-Netzteile
+    DEV1_V_MAX     : LREAL := 30.0;     // PSU1 max. 30 V
+    DEV2_V_MAX     : LREAL := 75.0;     // PSU2 max. 75 V
+    VPROG_RANGE_V  : LREAL := 5.0;      // Vprog 0..5 V
+    VMON_RANGE_V   : LREAL := 5.0;      // Vmon  0..5 V
+
+    // FuG HCN (HV)
+    DEVHV_V_MAX    : LREAL := 6500.0;   // 0..6500 V
+    DEVHV_I_MAX_mA : LREAL := 1.0;      // 0..1 mA
+    HV_USET_RANGE  : LREAL := 10.0;     // U_set 0..10 V
+    HV_MON_RANGE   : LREAL := 10.0;     // U/I_mon 0..10 V
+
+    // Pressure control
+    P_V_MAX        : LREAL := 10.0;     // Stell- und Rücklesespannung 0..10 V
+
+    // Beckhoff-Karten (Standard-0..10V)
+    AO_RANGE_V     : LREAL := 10.0;     // EL4104
+    AI_RANGE_V     : LREAL := 10.0;     // EL3164
+
+    // Vollaussteuerungswerte der Wandler (16 Bit)
+    AO_FULL_SCALE  : LREAL := 32767.0;  // DAC max
+    AI_FULL_SCALE  : LREAL := 32767.0;  // ADC max
+
+    // -----------------------------
+    // 4) Istwerte (zurückgerechnete Messwerte)
+    // -----------------------------
+    // Aus den AI-Rohwerten gewandelte physikalische Größen.
+    MeasV1_V      : LREAL;  // PSU1: 0..30 V
+    MeasV2_V      : LREAL;  // PSU2: 0..75 V
+    MeasU_HV1_V   : LREAL;  // HV1:  0..6500 V
+    MeasI_HV1_mA  : LREAL;  // HV1:  0..1 mA
+    MeasU_HV4_V   : LREAL;  // HV4:  0..6500 V
+    MeasI_HV4_mA  : LREAL;  // HV4:  0..1 mA
+    MeasP_V       : LREAL;  // Pressure control: 0..10 V
+
+    // -----------------------------
+    // 5) MQTT – Bausteine und Hilfsvariablen
+    // -----------------------------
+    fbMqttClient   : FB_IotMqttClient;         // MQTT-Client
+    fbMessageQueue : FB_IotMqttMessageQueue;  // Queue für RX
+    fbMessage      : FB_IotMqttMessage;       // eine einzelne RX-Message
+    bMqttInit      : BOOL := TRUE;            // einmalige Init
+    bSubsDone      : BOOL := FALSE;           // Subscriptions schon gemacht?
+
+    // Puffer für Sendestrings
+    sBuf  : STRING(128);
+    nSize : UDINT;
+
+    // -----------------------------
+    // 6) MQTT-Topics – Telemetrie
+    // -----------------------------
+    // Spannungs-Soll/Ist für Delta
+    t1_set : STRING(63) := 'psu/1/set_v';
+    t1_mev : STRING(63) := 'psu/1/meas_v';
+    t2_set : STRING(63) := 'psu/2/set_v';
+    t2_mev : STRING(63) := 'psu/2/meas_v';
+
+    // Spannungs-/Stromwerte für HV
+    thv1_set  : STRING(63) := 'hv/1/set_v';
+    thv1_mev  : STRING(63) := 'hv/1/meas_v';
+    thv1_mei  : STRING(63) := 'hv/1/meas_i_mA';
+    thv4_set  : STRING(63) := 'hv/4/set_v';
+    thv4_mev  : STRING(63) := 'hv/4/meas_v';
+    thv4_mei  : STRING(63) := 'hv/4/meas_i_mA';
+
+    // Pressure-Control Telemetrie
+    tP_set    : STRING(63) := 'pressure/set_v';    // Sollwert
+    tP_mev    : STRING(63) := 'pressure/meas_v';   // Istwert
+
+    // Debug: Counts der Analogausgänge
+    t_dbg_ao1 : STRING(63) := 'psu/dbg/ao1_counts';
+    t_dbg_ao2 : STRING(63) := 'psu/dbg/ao2_counts';
+    t_dbg_ao3 : STRING(63) := 'hv/dbg/ao3_counts';
+    t_dbg_ao4 : STRING(63) := 'hv/dbg/ao4_counts';
+    t_dbg_aoP : STRING(63) := 'pressure/dbg/ao_counts';
+
+    // -----------------------------
+    // 7) MQTT-Topics – Kommandos (Eingang)
+    // -----------------------------
+    // Hier kommen die Sollwerte als Text (z.B. "42.0") rein.
+    t1_cmd_set    : STRING(63) := 'psu/1/cmd/set_v';
+    t2_cmd_set    : STRING(63) := 'psu/2/cmd/set_v';
+    thv1_cmd_set  : STRING(63) := 'hv/1/cmd/set_v';
+    thv4_cmd_set  : STRING(63) := 'hv/4/cmd/set_v';
+    tP_cmd_set    : STRING(63) := 'pressure/cmd/set_v';
+
+    // -----------------------------
+    // 8) Puffer für eingehende MQTT-Nachrichten
+    // -----------------------------
+    rxTopic   : STRING(128);   // hier landet das Topic
+    rxPayload : STRING(128);   // hier landet die Nutzlast (z.B. "123.4")
+
+    // -----------------------------
+    // 9) Hilfsvariablen für Rechenoperationen
+    // -----------------------------
+    _aoRaw : LREAL;   // Zwischenergebnis AO-Counts (vor Rundung)
+    _v     : LREAL;   // Hilfsgröße für AI->Volt (0..10 V)
+
+    // -----------------------------
+    // 10) 1 Hz Timer für Telemetrie
+    // -----------------------------
+    // Steuert die Rate, mit der Telemetrie gepublished wird.
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+///////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+
+// ======================== MQTT INITIALISIERUNG ========================
+// Wird in jedem Zyklus aufgerufen, aber der Inhalt im IF-Block nur einmal,
+// solange bMqttInit noch TRUE ist.
+IF bMqttInit THEN
+    bMqttInit := FALSE;   // Einmalig auf FALSE setzen, damit Init nur einmal läuft
+
+    // Message-Queue mit dem MQTT-Client verknüpfen
+    // => alle eingehenden Messages landen in fbMessageQueue
+    fbMqttClient.ipMessageQueue := fbMessageQueue;
+
+    // Basisparameter für den MQTT-Client
+    fbMqttClient.sHostName := '192.168.0.20';    // IP-Adresse deines MQTT-Brokers
+    fbMqttClient.nHostPort := 1883;             // Standard-MQTT-Port
+    fbMqttClient.sClientId := 'cx7080-psu12-hv14-pressure'; // eindeutige Client-ID im Broker
+END_IF;
+
+// Den Client zyklisch "laufen lassen"
+// Execute(TRUE) sorgt dafür, dass der Baustein intern seine Statemachine abarbeitet
+// (Verbindungsaufbau, Keep-Alive, Senden/Empfangen, etc.)
+fbMqttClient.Execute(TRUE);
+
+// Sobald der Client verbunden ist (bConnected = TRUE) und wir die Subscriptions
+// noch nicht gesetzt haben, abonnieren wir genau einmal alle benötigten Topics.
+// bSubsDone verhindert, dass wir bei jedem Zyklus wieder subscribe() aufrufen.
+IF fbMqttClient.bConnected AND NOT bSubsDone THEN
+    fbMqttClient.Subscribe(t1_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);  // psu/1/cmd/set_v
+    fbMqttClient.Subscribe(t2_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);  // psu/2/cmd/set_v
+    fbMqttClient.Subscribe(thv1_cmd_set, TcIotMqttQos.AtMostOnceDelivery);  // hv/1/cmd/set_v
+    fbMqttClient.Subscribe(thv4_cmd_set, TcIotMqttQos.AtMostOnceDelivery);  // hv/4/cmd/set_v
+    fbMqttClient.Subscribe(tP_cmd_set,   TcIotMqttQos.AtMostOnceDelivery);  // pressure/cmd/set_v
+    bSubsDone := TRUE;  // merken, dass Subscriptions gesetzt wurden
+END_IF;
+
+
+// ======================== EINGEHENDE KOMMANDOS (MQTT RX) ========================
+// Hier werden empfangene MQTT-Nachrichten verarbeitet. Die Queue sammelt Messages,
+// wir ziehen sie der Reihe nach raus, lesen Topic + Payload und reagieren darauf.
+IF fbMessageQueue.nQueuedMessages > 0 THEN
+    // Dequeue() holt genau eine Nachricht aus der Queue in fbMessage
+    IF fbMessageQueue.Dequeue(fbMessage := fbMessage) THEN
+        // Topic-String in rxTopic schreiben
+        fbMessage.GetTopic(
+            pTopic     := ADR(rxTopic),
+            nTopicSize := SIZEOF(rxTopic)
+        );
+
+        // Payload-String in rxPayload schreiben, Nullterminierung einschalten
+        fbMessage.GetPayload(
+            pPayload            := ADR(rxPayload),
+            nPayloadSize        := SIZEOF(rxPayload),
+            bSetNullTermination := TRUE
+        );
+
+        // Jetzt prüfen wir, auf welchem Topic die Nachricht angekommen ist
+        // und übernehmen die Sollwerte. Dabei wird die ASCII-Zahl (STRING)
+        // in LREAL gewandelt und mit LIMIT() auf den gültigen Bereich begrenzt.
+
+        // PSU1 (Delta ES 030-5)
+        IF fbMessage.CompareTopic(sTopic := t1_cmd_set) THEN
+            // rxPayload z.B. "12.3" -> STRING_TO_LREAL -> 12.3
+            // LIMIT(0.0, x, DEV1_V_MAX) -> alles <0 wird 0, alles >30 wird 30
+            SetV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV1_V_MAX);
+
+        // PSU2 (Delta ES 075-2)
+        ELSIF fbMessage.CompareTopic(sTopic := t2_cmd_set) THEN
+            SetV2_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEV2_V_MAX);
+
+        // HV1 (FuG HCN 7E-6500)
+        ELSIF fbMessage.CompareTopic(sTopic := thv1_cmd_set) THEN
+            SetV_HV1_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        // HV4 (FuG HCN 7E-6500)
+        ELSIF fbMessage.CompareTopic(sTopic := thv4_cmd_set) THEN
+            SetV_HV4_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), DEVHV_V_MAX);
+
+        // Pressure-Steuerung (0..10 V direkt)
+        ELSIF fbMessage.CompareTopic(sTopic := tP_cmd_set) THEN
+            // hier ist P_V_MAX = 10.0, also Bereich 0..10 V
+            SetP_V := LIMIT(0.0, STRING_TO_LREAL(rxPayload), P_V_MAX);
+        END_IF
+    END_IF
+END_IF;
+
+
+// ======================== AO-SKALIERUNG & AUSGABE ========================
+// Hier werden die Sollwerte in Volt in Rohcounts für die EL4104 umgerechnet.
+// Die EL4104 arbeitet im Standard mit 0..10 V -> 0..32767 Counts.
+
+// --------------------------------------------------------
+// Delta ES*** (mit Vprog 0..5 V am 0..10-V-Ausgang der EL4104)
+// --------------------------------------------------------
+// Idee:
+//   - Das Netzteil erwartet 0..5 V auf Vprog, um 0..V_MAX zu liefern
+//   - Die EL4104 liefert 0..10 V bei 0..32767 Counts
+//   - Wir nutzen nur die untere Hälfte (0..5 V) des AO-Bereichs
+//   - Formel (wie im Kommentar beschrieben):
+//       Vprog  = (SollV / DEV_V_MAX) * 5 V
+//       counts = (Vprog / 10 V) * 32767
+//              = SollV * 32767 / (2 * DEV_V_MAX)
+
+// PSU1 (0..30 V)
+SetV1_V := LIMIT(0.0, SetV1_V, DEV1_V_MAX);              // sicherstellen: 0..30 V
+_aoRaw  := (SetV1_V * AO_FULL_SCALE) / (2.0 * DEV1_V_MAX);  // = SetV1_V * 32767 / 60
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);            // alles außerhalb 0..32767 begrenzen
+AO1_Vset := LREAL_TO_INT(_aoRaw);                        // LREAL -> INT wandeln
+
+// PSU2 (0..75 V)
+SetV2_V := LIMIT(0.0, SetV2_V, DEV2_V_MAX);              // 0..75 V
+_aoRaw  := (SetV2_V * AO_FULL_SCALE) / (2.0 * DEV2_V_MAX);  // = SetV2_V * 32767 / 150
+_aoRaw  := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO2_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// --------------------------------------------------------
+// FuG HCN (HV) mit U_set 0..10 V
+// --------------------------------------------------------
+// Hier nutzt du den vollen 0..10-V-Bereich der EL4104.
+// Zusammenhänge:
+//   U_set   = (SollV / DEVHV_V_MAX) * 10 V
+//   counts  = (U_set / 10 V) * 32767
+//           = SollV * 32767 / DEVHV_V_MAX
+
+// HV1 (0..6500 V)
+SetV_HV1_V := LIMIT(0.0, SetV_HV1_V, DEVHV_V_MAX);        // 0..6500 V
+_aoRaw     := (SetV_HV1_V * AO_FULL_SCALE) / DEVHV_V_MAX; // = *32767/6500
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO3_HV1_Vset := LREAL_TO_INT(_aoRaw);
+
+// HV4 (0..6500 V)
+SetV_HV4_V := LIMIT(0.0, SetV_HV4_V, DEVHV_V_MAX);
+_aoRaw     := (SetV_HV4_V * AO_FULL_SCALE) / DEVHV_V_MAX;
+_aoRaw     := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO4_HV4_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// --------------------------------------------------------
+// Pressure control: 0..10 V direkt (ohne „Umweg“ über andere Skalierung)
+// --------------------------------------------------------
+// Hier entspricht der Sollwert SetP_V direkt einer 0..10-V-Spannung.
+// Formel:
+//   counts = (SetP_V / 10 V) * 32767
+
+SetP_V := LIMIT(0.0, SetP_V, P_V_MAX);              // 0..10 V
+_aoRaw := (SetP_V / AO_RANGE_V) * AO_FULL_SCALE;    // AO_RANGE_V = 10.0
+_aoRaw := LIMIT(0.0, _aoRaw, AO_FULL_SCALE);
+AO_P_Vset := LREAL_TO_INT(_aoRaw);
+
+
+// ======================== AI -> ENGINEERING ========================
+// Jetzt der umgekehrte Weg: Die EL3164 liefert 0..10 V als 0..32767 Counts.
+// Wir rechnen alles zurück in physikalische Größen (V, mA).
+
+// Allgemeiner Zusammenhang für Spannung an EL3164:
+//   U_ai = counts / 32767 * 10 V
+
+// --------------------------------------------------------
+// Delta PSU1 (Vmon 0..5 V -> 0..30 V Ausgang)
+// --------------------------------------------------------
+// Vorgehen:
+//   1) Rohwert -> 0..10 V
+//   2) 0..5 V Anteil herausziehen
+//   3) auf Gerätespannung umrechnen (0..30 V -> Faktor 30/5)
+_v := MAX(0.0, INT_TO_LREAL(AI1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V; // 0..10 V aus dem ADC-Wert
+MeasV1_V := _v * (DEV1_V_MAX / VMON_RANGE_V);                        // (30/5) = 6 -> 0..30 V
+
+// --------------------------------------------------------
+// Delta PSU2 (Vmon 0..5 V -> 0..75 V)
+// --------------------------------------------------------
+_v := MAX(0.0, INT_TO_LREAL(AI2_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasV2_V := _v * (DEV2_V_MAX / VMON_RANGE_V);                        // (75/5) = 15 -> 0..75 V
+
+// --------------------------------------------------------
+// HV1 (U_mon 0..10 V -> 0..6500 V, I_mon 0..10 V -> 0..1 mA)
+// --------------------------------------------------------
+// Spannung HV1:
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;  // 0..10 V
+MeasU_HV1_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);                        // (6500/10)
+
+// Strom HV1:
+_v := MAX(0.0, INT_TO_LREAL(AI_HV1_Imon)) / AI_FULL_SCALE * AI_RANGE_V;  // 0..10 V
+MeasI_HV1_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);                    // (1/10) -> 0..1 mA
+
+// --------------------------------------------------------
+// HV4 (analog zu HV1)
+// --------------------------------------------------------
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Vmon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasU_HV4_V := _v * (DEVHV_V_MAX / HV_MON_RANGE);
+
+_v := MAX(0.0, INT_TO_LREAL(AI_HV4_Imon)) / AI_FULL_SCALE * AI_RANGE_V;
+MeasI_HV4_mA := _v * (DEVHV_I_MAX_mA / HV_MON_RANGE);
+
+// --------------------------------------------------------
+// Pressure control: 0..10 V Readback direkt
+// --------------------------------------------------------
+// Hier brauchst du keine zusätzliche Skalierung: 0..10 V am Eingang
+// entsprechen direkt 0..10 "Engineering-Volt".
+_v := MAX(0.0, INT_TO_LREAL(AI_P_Vfb)) / AI_FULL_SCALE * AI_RANGE_V; // 0..10 V
+MeasP_V := _v;                                                       // 1:1 übernehmen
+
+
+// ======================== 1x/S TELEMETRIE PUBLISH ========================
+// tick1s ist ein TON-Timer mit PT = 1 s.
+// Wir setzen IN jedes Mal auf TRUE, und wenn Q = TRUE wird, wissen wir:
+// 1 Sekunde ist vergangen. Dann setzen wir IN kurz auf FALSE, damit der
+// Timer neu starten kann.
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);   // Timer zurücksetzen, damit er im nächsten Zyklus erneut startet
+
+    // Nur publishen, wenn der MQTT-Client wirklich verbunden ist
+    IF fbMqttClient.bConnected THEN
+
+        // ---------- Delta PSU1 ----------
+        // Sollwert publizieren
+        sBuf := LREAL_TO_STRING(SetV1_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Istwert publizieren
+        sBuf := LREAL_TO_STRING(MeasV1_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t1_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Debug: DAC-Rohwert (Counts)
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO1_Vset));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- Delta PSU2 ----------
+        sBuf := LREAL_TO_STRING(SetV2_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV2_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t2_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO2_Vset));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- HV1 ----------
+        // Sollspannung HV1
+        sBuf := LREAL_TO_STRING(SetV_HV1_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Istspannung HV1
+        sBuf := LREAL_TO_STRING(MeasU_HV1_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Iststrom HV1
+        sBuf := LREAL_TO_STRING(MeasI_HV1_mA);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv1_mei, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Debug DAC-Wert HV1
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO3_HV1_Vset));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao3, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- HV4 ----------
+        sBuf := LREAL_TO_STRING(SetV_HV4_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasU_HV4_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasI_HV4_mA);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(thv4_mei, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO4_HV4_Vset));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_ao4, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+
+        // ---------- Pressure control ----------
+        // Sollwert
+        sBuf := LREAL_TO_STRING(SetP_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_set, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Istwert
+        sBuf := LREAL_TO_STRING(MeasP_V);
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(tP_mev, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // Debug DAC-Wert
+        sBuf := UDINT_TO_STRING(TO_UDINT(AO_P_Vset));
+        nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_dbg_aoP, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF

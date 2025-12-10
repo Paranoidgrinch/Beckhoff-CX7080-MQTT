@@ -1,0 +1,130 @@
+USING Tc3_IotBase;
+
+PROGRAM MAIN
+VAR
+    // Sollwerte (0..30V)
+    SetV1_V : LREAL := 0.0;
+    SetV2_V : LREAL := 0.0;
+
+    // I/O-Rohwerte (im I/O-Mapping verknüpfen)
+    AO1_Vset AT %Q* : UINT;
+    AO2_Vset AT %Q* : UINT;
+    AI1_Vmon AT %I* : INT;
+    AI1_Imon AT %I* : INT;
+    AI2_Vmon AT %I* : INT;
+    AI2_Imon AT %I* : INT;
+
+    // Istwerte
+    MeasV1_V : LREAL;
+    MeasI1_A : LREAL;
+    MeasV2_V : LREAL;
+    MeasI2_A : LREAL;
+
+    // Skalierung
+    AO_FULL_SCALE : LREAL := 65535.0;  // 0..10V -> 0..65535
+    AI_FULL_SCALE : LREAL := 32768.0;  // 0..10V -> 0..32768
+    DEV_V_MAX     : LREAL := 30.0;     // 0..30V
+    DEV_I_MAX     : LREAL := 5.0;      // 0..5A
+
+    // MQTT
+    fbMqttClient : FB_IotMqttClient;
+    bMqttInit    : BOOL := TRUE;
+    sBuf         : STRING(64);
+    nSize        : UDINT;
+
+    t_set1  : STRING(63) := 'psu/1/set_v';
+    t_mev1  : STRING(63) := 'psu/1/meas_v';
+    t_mei1  : STRING(63) := 'psu/1/meas_i';
+    t_set2  : STRING(63) := 'psu/2/set_v';
+    t_mev2  : STRING(63) := 'psu/2/meas_v';
+    t_mei2  : STRING(63) := 'psu/2/meas_i';
+
+    // Hilfsvariablen
+    _aoRaw : LREAL;
+    tick1s : TON := (PT := T#1S);
+END_VAR
+
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+
+// MQTT init (einmalig)
+IF bMqttInit THEN
+    bMqttInit := FALSE;
+    fbMqttClient.sHostName := '192.168.0.20';
+    fbMqttClient.nHostPort := 1883;
+    fbMqttClient.sClientId := 'cx7080-psu2';
+END_IF;
+fbMqttClient.Execute(TRUE);
+
+// PSU1: Sollspannung begrenzen -> AO
+IF SetV1_V < 0.0 THEN
+    SetV1_V := 0.0;
+ELSIF SetV1_V > DEV_V_MAX THEN
+    SetV1_V := DEV_V_MAX;
+END_IF;
+
+_aoRaw := (SetV1_V / DEV_V_MAX) * AO_FULL_SCALE; // 30V -> 65535
+IF _aoRaw < 0.0 THEN
+    _aoRaw := 0.0;
+END_IF;
+IF _aoRaw > AO_FULL_SCALE THEN
+    _aoRaw := AO_FULL_SCALE;
+END_IF;
+AO1_Vset := LREAL_TO_UINT(_aoRaw);
+
+// PSU2: Sollspannung begrenzen -> AO
+IF SetV2_V < 0.0 THEN
+    SetV2_V := 0.0;
+ELSIF SetV2_V > DEV_V_MAX THEN
+    SetV2_V := DEV_V_MAX;
+END_IF;
+
+_aoRaw := (SetV2_V / DEV_V_MAX) * AO_FULL_SCALE;
+IF _aoRaw < 0.0 THEN
+    _aoRaw := 0.0;
+END_IF;
+IF _aoRaw > AO_FULL_SCALE THEN
+    _aoRaw := AO_FULL_SCALE;
+END_IF;
+AO2_Vset := LREAL_TO_UINT(_aoRaw);
+
+// AI -> Engineering
+MeasV1_V := (INT_TO_LREAL(AI1_Vmon) / AI_FULL_SCALE) * DEV_V_MAX;
+MeasI1_A := (INT_TO_LREAL(AI1_Imon) / AI_FULL_SCALE) * DEV_I_MAX;
+MeasV2_V := (INT_TO_LREAL(AI2_Vmon) / AI_FULL_SCALE) * DEV_V_MAX;
+MeasI2_A := (INT_TO_LREAL(AI2_Imon) / AI_FULL_SCALE) * DEV_I_MAX;
+
+// Jede Sekunde publishen
+tick1s(IN := TRUE);
+IF tick1s.Q THEN
+    tick1s(IN := FALSE);
+
+    IF fbMqttClient.bConnected THEN
+        // PSU1
+        sBuf := LREAL_TO_STRING(SetV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_set1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV1_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_mev1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasI1_A); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_mei1, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        // PSU2
+        sBuf := LREAL_TO_STRING(SetV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_set2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasV2_V); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_mev2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+
+        sBuf := LREAL_TO_STRING(MeasI2_A); nSize := TO_UDINT(LEN(sBuf));
+        fbMqttClient.Publish(t_mei2, ADR(sBuf), nSize, TcIotMqttQos.AtMostOnceDelivery, FALSE, FALSE);
+    END_IF
+END_IF

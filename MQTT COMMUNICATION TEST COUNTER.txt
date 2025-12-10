@@ -1,0 +1,76 @@
+PROGRAM MAIN
+VAR
+    // --- MQTT ---
+    fbMqttClient : FB_IotMqttClient;
+    bSetParam    : BOOL := TRUE;
+    bConnect     : BOOL := TRUE;
+    sTopic       : STRING(255) := 'cx7080/counter';
+    sPayload     : STRING(255);
+    nSize        : UDINT; // Größe der Nutzlast in Bytes
+
+    // --- Zähler ---
+    nCnt         : INT := 0;
+    fbTick       : TON := (PT := T#1S);   // Timer für 1 Sekunde
+END_VAR
+
+
+
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+
+
+
+// ----------------------------------------------------------------------
+// MQTT-Parameter nur einmal beim Start setzen
+// ----------------------------------------------------------------------
+IF bSetParam THEN
+    bSetParam := FALSE;
+
+    // -> IP-Adresse deines MQTT-Brokers (PC mit Mosquitto)
+    fbMqttClient.sHostName := '192.168.0.20';
+    fbMqttClient.nHostPort := 1883;             // Standardport ohne TLS
+    fbMqttClient.sClientId := 'cx7080-1';       // Eindeutige Client-ID
+END_IF;
+
+
+// ----------------------------------------------------------------------
+// MQTT-Client zyklisch ausführen
+// ----------------------------------------------------------------------
+fbMqttClient.Execute(bConnect);
+
+
+// ----------------------------------------------------------------------
+// Wenn Verbindung steht → jede Sekunde Zählerstand publishen
+// ----------------------------------------------------------------------
+IF fbMqttClient.bConnected THEN
+
+    fbTick(IN := TRUE);
+
+    IF fbTick.Q THEN
+        fbTick(IN := FALSE);
+
+        // --- Zähler hochzählen 0–100 ---
+        IF nCnt >= 100 THEN
+            nCnt := 0;
+        ELSE
+            nCnt := nCnt + 1;
+        END_IF;
+
+        // --- Zahl in String umwandeln ---
+        sPayload := TO_STRING(nCnt);
+
+        // --- Länge des Strings als UDINT ---
+        nSize := TO_UDINT(LEN(sPayload));
+
+        // --- MQTT Publish ---
+        fbMqttClient.Publish(
+            sTopic       := sTopic,
+            pPayload     := ADR(sPayload),
+            nPayloadSize := nSize,
+            eQoS         := TcIotMqttQos.AtMostOnceDelivery, // QoS 0
+            bRetain      := FALSE,
+            bQueue       := FALSE
+        );
+    END_IF
+END_IF
